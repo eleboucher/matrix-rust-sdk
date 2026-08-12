@@ -263,7 +263,7 @@ impl OwnUserIdentity {
 
         #[cfg(feature = "experimental-x509-identity-verification")]
         if let Some(x509_signer) = x509_signer {
-            x509_signer.sign_cross_signing_key(&self.user_id, &mut cross_signing_key)?;
+            x509_signer.sign_cross_signing_key(&self.user_id, &mut cross_signing_key).await?;
         }
 
         let mut user_signed_keys = SignedKeys::new();
@@ -1660,8 +1660,8 @@ pub(crate) mod tests {
         assert_eq!(*id.verified.read(), OwnUserIdentityVerifiedState::VerificationViolation);
     }
 
-    #[test]
-    fn own_identity_check_signatures() {
+    #[async_test]
+    async fn test_own_identity_check_signatures() {
         let response = own_key_query();
         let identity = get_own_identity();
         let (first, second) = device(&response);
@@ -1670,7 +1670,7 @@ pub(crate) mod tests {
         assert!(identity.is_device_signed(&second));
 
         let account = Account::with_device_id(second.user_id(), second.device_id());
-        let verification_machine = get_verification_machine(&account);
+        let verification_machine = get_verification_machine(&account).await;
 
         let first = Device {
             inner: first,
@@ -1703,7 +1703,7 @@ pub(crate) mod tests {
         let (_, device) = device(&response);
 
         let account = Account::with_device_id(device.user_id(), device.device_id());
-        let verification_machine = get_verification_machine(&account);
+        let verification_machine = get_verification_machine(&account).await;
         let public_identity = verification_machine.get_own_user_identity_data().await.unwrap();
 
         let mut device = Device {
@@ -2115,7 +2115,7 @@ pub(crate) mod tests {
 
         // (And Bob exists)
         let bob_account = Account::with_device_id(user_id!("@bob:hs.co"), device_id!("DEV123"));
-        let bob_verification_machine = get_verification_machine(&bob_account);
+        let bob_verification_machine = get_verification_machine(&bob_account).await;
 
         let bob_identity_data =
             bob_verification_machine.get_own_user_identity_data().await.unwrap();
@@ -2159,7 +2159,7 @@ pub(crate) mod tests {
         let account = Account::with_device_id(user_id!("@alice:hs.co"), device_id!("DEV123"));
 
         let private_identity =
-            PrivateCrossSigningIdentity::for_account(&account, Some(&x509_signer)).unwrap();
+            PrivateCrossSigningIdentity::for_account(&account, Some(&x509_signer)).await.unwrap();
 
         let public_identity = private_identity.to_public_identity().await.unwrap();
 
@@ -2177,7 +2177,7 @@ pub(crate) mod tests {
         let account =
             Account::with_device_id(user_id!("@own_user:localhost"), device_id!("DEV123"));
 
-        let verification_machine = get_verification_machine(&account);
+        let verification_machine = get_verification_machine(&account).await;
         let own_identity_data = verification_machine.get_own_user_identity_data().await.unwrap();
 
         OtherUserIdentity {
@@ -2195,12 +2195,13 @@ pub(crate) mod tests {
      *
      * Creates a new private user identity for the account.
      */
-    fn get_verification_machine(account: &Account) -> VerificationMachine {
+    async fn get_verification_machine(account: &Account) -> VerificationMachine {
         let private_identity = PrivateCrossSigningIdentity::for_account(
             account,
             #[cfg(feature = "experimental-x509-identity-verification")]
             None,
         )
+        .await
         .unwrap();
         VerificationMachine::new(
             account.static_data().clone(),
@@ -2226,7 +2227,8 @@ pub(crate) mod tests {
         use crate::store::types::{Changes, IdentityChanges, PendingChanges};
 
         let account_static_data = account.static_data().clone();
-        let private_identity = PrivateCrossSigningIdentity::for_account(&account, None).unwrap();
+        let private_identity =
+            PrivateCrossSigningIdentity::for_account(&account, None).await.unwrap();
 
         let crypto_store_wrapper =
             CryptoStoreWrapper::new(account.user_id(), account.device_id(), MemoryStore::new());

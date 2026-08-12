@@ -1117,6 +1117,7 @@ mod tests {
                 #[cfg(feature = "experimental-x509-identity-verification")]
                 None,
             )
+            .await
             .unwrap(),
         ));
 
@@ -1165,6 +1166,7 @@ mod tests {
                 #[cfg(feature = "experimental-x509-identity-verification")]
                 None,
             )
+            .await
             .unwrap(),
         ));
 
