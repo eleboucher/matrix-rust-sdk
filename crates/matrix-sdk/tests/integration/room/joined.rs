@@ -944,6 +944,58 @@ async fn test_make_reply_event_doesnt_require_event_cache() {
     room.make_edit_event(event_id, EditedContent::RoomMessage(new_content)).await.unwrap();
 }
 
+#[cfg(feature = "e2e-encryption")]
+#[async_test]
+async fn test_encrypt_raw_event_without_sending() {
+    use ruma::{events::room::encrypted::OriginalSyncRoomEncryptedEvent, serde::Raw};
+
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room_id = room_id!("!encrypted:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+    server.mock_room_state_encryption().encrypted().mount().await;
+    server.mock_get_members().ok(Vec::new()).mock_once().mount().await;
+    server.mock_room_send().ok(event_id!("$unused")).never().mount().await;
+
+    let content = Raw::new(&RoomMessageEventContent::text_plain("prepared message"))
+        .unwrap()
+        .cast_unchecked();
+    let encrypted = room.encrypt_raw_event("m.room.message", &content).await.unwrap();
+    let event: Raw<OriginalSyncRoomEncryptedEvent> = Raw::new(&json!({
+        "type": "m.room.encrypted",
+        "event_id": "$prepared",
+        "room_id": room_id,
+        "sender": client.user_id().unwrap(),
+        "origin_server_ts": 1,
+        "content": encrypted,
+    }))
+    .unwrap()
+    .cast_unchecked();
+    let decrypted = room.decrypt_event(&event, None).await.unwrap();
+    matrix_sdk::assert_decrypted_message_eq!(
+        decrypted,
+        "prepared message",
+        "Prepared content must decrypt without being sent"
+    );
+}
+
+#[cfg(feature = "e2e-encryption")]
+#[async_test]
+async fn test_encrypt_raw_event_requires_encrypted_room() {
+    use ruma::serde::Raw;
+
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room = server.sync_joined_room(&client, room_id!("!plain:example.org")).await;
+    server.mock_room_state_encryption().plain().mount().await;
+    let content =
+        Raw::new(&RoomMessageEventContent::text_plain("message")).unwrap().cast_unchecked();
+    assert_matches!(
+        room.encrypt_raw_event("m.room.message", &content).await,
+        Err(matrix_sdk::Error::InsufficientData)
+    );
+}
+
 #[async_test]
 async fn test_enable_encryption_doesnt_stay_unknown() {
     let mock = MatrixMockServer::new().await;
