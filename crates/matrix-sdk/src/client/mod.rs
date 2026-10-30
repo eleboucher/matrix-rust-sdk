@@ -46,6 +46,8 @@ use matrix_sdk_base::{
     task_monitor::TaskMonitor,
 };
 use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, sleep::sleep, ttl::TtlValue};
+#[cfg(feature = "unstable-msc4560")]
+use ruma::events::{AnyStrippedStateEvent, StateEventType};
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{InitialStateEvent, room::encryption::RoomEncryptionEventContent};
 use ruma::{
@@ -204,6 +206,30 @@ impl From<discover_homeserver::TileServerInfo> for TileServerInfo {
     fn from(value: discover_homeserver::TileServerInfo) -> Self {
         Self { map_style_url: value.map_style_url }
     }
+}
+
+/// A room's stripped state information.
+#[cfg(feature = "unstable-msc4560")]
+#[derive(Debug, Clone)]
+pub struct RoomStrippedState {
+    /// The resolved room ID.
+    pub room_id: OwnedRoomId,
+    /// The requested stripped state events.
+    pub state: Vec<AnyStrippedStateEvent>,
+    /// The joined member count, if requested and available.
+    pub num_joined_members: Option<u64>,
+    /// Where this state was obtained.
+    pub via: RoomStrippedStateVia,
+}
+
+/// The source used to provide a room's stripped state.
+#[cfg(feature = "unstable-msc4560")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoomStrippedStateVia {
+    /// The stripped state was built by the client.
+    Client,
+    /// The stripped state was downloaded from a remote server.
+    Remote(OwnedServerName),
 }
 
 /// An async/await enabled Matrix client.
@@ -1727,6 +1753,81 @@ impl Client {
         }
 
         RoomPreview::from_remote_room(self, room_id, room_or_alias_id, via).await
+    }
+
+    /// Get a room's stripped state events, either from a remote server or from
+    /// the client's local state store.
+    ///
+    /// Only event types listed in
+    /// [`ruma::events::ALLOWED_STRIPPED_STATE_EVENTS`] should be supplied
+    /// to this function. The SDK does not check the provided event types
+    /// against this list, to allow future expansion and vendor-specific
+    /// server configuration, but if you provide events that aren't
+    /// whitelisted you risk sporadic errors when the SDK has to contact the
+    /// homeserver instead of using its event cache.
+    #[cfg(feature = "unstable-msc4560")]
+    pub async fn get_room_stripped_state(
+        &self,
+        room_or_alias_id: &RoomOrAliasId,
+        via: Vec<OwnedServerName>,
+        event_types: BTreeSet<StateEventType>,
+        num_joined_members: bool,
+    ) -> Result<RoomStrippedState> {
+        use ruma::api::client::state::get_stripped_state;
+
+        let room_id = match <&RoomId>::try_from(room_or_alias_id) {
+            Ok(room_id) => room_id.to_owned(),
+            Err(alias) => self.resolve_room_alias(alias).await?.room_id,
+        };
+
+        if let Some(room) = self.get_room(&room_id)
+            && matches!(room.state(), RoomState::Joined | RoomState::Banned)
+        {
+            // We can build the state locally without asking the homeserver.
+            // This isn't possible for left rooms because we aren't in them, and
+            // we only have limited state for knocked and invited
+            // rooms.
+
+            let mut state = vec![];
+
+            for event_type in event_types {
+                let events: Vec<_> = room
+                    .get_state_events(event_type)
+                    .await?
+                    .into_iter()
+                    .map(|event| event.to_stripped().deserialize())
+                    .collect::<Result<_, _>>()?;
+
+                state.extend(events);
+            }
+
+            let num_joined_members = num_joined_members.then(|| room.joined_members_count());
+
+            return Ok(RoomStrippedState {
+                room_id,
+                state,
+                num_joined_members,
+                via: RoomStrippedStateVia::Client,
+            });
+        }
+
+        let response = self
+            .send(assign!(
+                get_stripped_state::unstable::Request::new(room_id.clone().into(), via),
+                { state: event_types, num_joined_members }
+            ))
+            .await?;
+
+        Ok(RoomStrippedState {
+            room_id,
+            state: response
+                .state
+                .into_iter()
+                .map(|event| event.deserialize())
+                .collect::<Result<_, _>>()?,
+            num_joined_members: response.num_joined_members.map(Into::into),
+            via: RoomStrippedStateVia::Remote(response.via),
+        })
     }
 
     /// Resolve a room alias to a room id and a list of servers which know about
@@ -5695,6 +5796,102 @@ pub(crate) mod tests {
             .expect("Room preview should be retrieved");
 
         assert_eq!(joined_room.room_id(), preview.room_id);
+    }
+
+    #[async_test]
+    #[cfg(feature = "unstable-msc4560")]
+    async fn test_room_stripped_state_for_uncached_or_partial_rooms() {
+        use std::collections::BTreeSet;
+
+        use ruma::{events::StateEventType, owned_server_name};
+
+        use crate::client::RoomStrippedStateVia;
+
+        for room_state in
+            [None, Some(RoomState::Invited), Some(RoomState::Left), Some(RoomState::Knocked)]
+        {
+            let server = MatrixMockServer::new().await;
+            let client = server.client_builder().build().await;
+            let room_id = room_id!("!a-room:matrix.org");
+            let event_types = BTreeSet::from([StateEventType::RoomName]);
+            server.mock_room_stripped_state().ok(&event_types, false).mock_once().mount().await;
+            if let Some(room_state) = room_state {
+                client.inner.base_client.get_or_create_room(room_id, room_state);
+            }
+
+            let state = client
+                .get_room_stripped_state(room_id.into(), vec![], event_types, false)
+                .await
+                .unwrap();
+
+            assert_eq!(state.room_id, room_id);
+            assert_eq!(state.state[0].event_type(), StateEventType::RoomName);
+            assert_eq!(state.num_joined_members, None);
+            assert_eq!(state.via, RoomStrippedStateVia::Remote(owned_server_name!("localhost")));
+        }
+    }
+
+    #[async_test]
+    #[cfg(feature = "unstable-msc4560")]
+    async fn test_room_stripped_state_uses_complete_local_state() {
+        use std::collections::BTreeSet;
+
+        use crate::client::RoomStrippedStateVia;
+
+        // Use the same cache policy as `get_room_preview`.
+        for room_state in [RoomState::Joined, RoomState::Banned] {
+            let server = MatrixMockServer::new().await;
+            let client = server.client_builder().build().await;
+            let room_id = room_id!("!a-room:matrix.org");
+            let event_types = BTreeSet::new();
+            server.mock_room_stripped_state().ok(&event_types, true).never().mount().await;
+            client.inner.base_client.get_or_create_room(room_id, room_state);
+
+            let state = client
+                .get_room_stripped_state(room_id.into(), vec![], event_types, true)
+                .await
+                .unwrap();
+
+            assert_eq!(state.room_id, room_id);
+            assert!(state.state.is_empty());
+            assert_eq!(state.num_joined_members, Some(0));
+            assert_eq!(state.via, RoomStrippedStateVia::Client);
+        }
+    }
+
+    #[async_test]
+    #[cfg(feature = "unstable-msc4560")]
+    async fn test_room_stripped_state_returns_requested_local_events() {
+        use std::collections::BTreeSet;
+
+        use ruma::events::StateEventType;
+
+        use crate::client::RoomStrippedStateVia;
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!a-room:matrix.org");
+        let f = EventFactory::new().sender(client.user_id().unwrap());
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_state_event(f.room_name("Cached room")),
+            )
+            .await;
+        let event_types = BTreeSet::from([StateEventType::RoomName]);
+        server.mock_room_stripped_state().ok(&event_types, false).never().mount().await;
+
+        let state = client
+            .get_room_stripped_state(room_id.into(), vec![], event_types, false)
+            .await
+            .unwrap();
+        assert_eq!(state.room_id, room_id);
+        assert_eq!(state.state.len(), 1);
+        assert_let!(ruma::events::AnyStrippedStateEvent::RoomName(event) = &state.state[0]);
+        assert_eq!(event.content.name.as_deref(), Some("Cached room"));
+        assert_eq!(event.sender, client.user_id().unwrap());
+        assert_eq!(state.num_joined_members, None);
+        assert_eq!(state.via, RoomStrippedStateVia::Client);
     }
 
     #[async_test]
