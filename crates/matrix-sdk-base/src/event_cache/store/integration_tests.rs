@@ -2451,6 +2451,17 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
 
         assert_eq!(events.len(), 1);
         assert_expected_events!(events, [first_event]);
+
+        let events = self.get_room_events(room_id, None, Some("session_1")).await.unwrap();
+        assert_expected_events!(events, [first_event]);
+
+        assert!(
+            self.get_room_events(room_id, Some("m.room.message"), Some("session_1"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(self.get_room_events(room_id, None, Some("unknown")).await.unwrap().is_empty());
     }
 
     async fn test_get_room_events_with_event_in_room_and_thread(&self) {
