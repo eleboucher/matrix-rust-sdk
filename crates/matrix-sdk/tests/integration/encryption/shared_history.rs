@@ -43,16 +43,17 @@ struct Test {
 /// Sets up the shared-history scenario up to the point where Bob has joined the
 /// room and the bundle info to-device event is ready to be delivered.
 ///
-/// Both tests below share this identical preamble:
+/// These tests share this setup:
 ///
 /// - Server + Alice + Bob clients created
 /// - E2EE identities exchanged
 /// - Alice creates an encrypted room and sends a message
-/// - Alice invites Bob, triggering key bundle upload
+/// - Alice shares history with Bob and invites him
 /// - Bob syncs the invite and joins
 /// - Bundle details are verified
 async fn setup_shared_history(
     bob_builder_fn: impl FnOnce(matrix_sdk::ClientBuilder) -> matrix_sdk::ClientBuilder,
+    share_explicitly: bool,
 ) -> Test {
     let room_id = room_id!("!test:localhost");
     let mxid = mxc_uri!("mxc://localhost/12345");
@@ -73,7 +74,7 @@ async fn setup_shared_history(
         .client_builder_for_crypto_end_to_end(alice_user_id, alice_device_id)
         .on_builder(|builder| {
             builder
-                .with_enable_share_history_on_invite(true)
+                .with_enable_share_history_on_invite(!share_explicitly)
                 .with_encryption_settings(encryption_settings)
         })
         .build()
@@ -144,6 +145,9 @@ async fn setup_shared_history(
 
     let (_guard, bundle_info) = matrix_mock_server.mock_capture_put_to_device(alice_user_id).await;
 
+    if share_explicitly {
+        room.share_history_with(bob_user_id).await.unwrap();
+    }
     room.invite_user_by_id(bob_user_id).await.expect("We should be able to invite Bob");
     let bundle = receiver.await.expect("We should have received a bundle now.");
 
@@ -187,6 +191,15 @@ async fn setup_shared_history(
 
 #[async_test]
 async fn test_shared_history_out_of_order() {
+    check_shared_history_out_of_order(false).await;
+}
+
+#[async_test]
+async fn test_explicit_shared_history_out_of_order() {
+    check_shared_history_out_of_order(true).await;
+}
+
+async fn check_shared_history_out_of_order(share_explicitly: bool) {
     let room_id = room_id!("!test:localhost");
     let alice_user_id = user_id!("@alice:localhost");
     let alice_device_id = device_id!("ALICEDEVICE");
@@ -200,7 +213,7 @@ async fn test_shared_history_out_of_order() {
         bundle_info,
         event_receiver,
         ..
-    } = setup_shared_history(|builder| builder).await;
+    } = setup_shared_history(|builder| builder, share_explicitly).await;
 
     let mut bundle_stream = bob
         .encryption()
@@ -296,7 +309,8 @@ async fn test_shared_history_crash_before_import() {
 
     let Test {
         matrix_mock_server, alice, bob, event_id, bundle, bundle_info, event_receiver, ..
-    } = setup_shared_history(|builder| builder.sqlite_store(bob_sqlite_path.path(), None)).await;
+    } = setup_shared_history(|builder| builder.sqlite_store(bob_sqlite_path.path(), None), false)
+        .await;
 
     matrix_mock_server
         .mock_authed_media_download()
