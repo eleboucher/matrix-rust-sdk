@@ -49,7 +49,7 @@ use tracing::{Instrument, debug, error, info, instrument, trace, warn};
 use crate::types::events::room::encrypted::RoomEncryptedEventContent;
 use crate::{
     Device, DeviceData, EncryptionSettings, OlmError,
-    error::{EventError, MegolmResult, OlmResult},
+    error::{EventError, MegolmError, MegolmResult, OlmResult},
     identities::device::MaybeEncryptedRoomKey,
     olm::{
         InboundGroupSession, OutboundGroupSession, OutboundGroupSessionEncryptionResult,
@@ -214,9 +214,10 @@ impl GroupSessionManager {
         content: &Raw<AnyMessageLikeEventContent>,
     ) -> MegolmResult<OutboundGroupSessionEncryptionResult> {
         let session =
-            self.sessions.get_or_load(room_id).await.expect("Session wasn't created nor shared");
-
-        assert!(!session.expired(), "Session expired");
+            self.sessions.get_or_load(room_id).await.ok_or(MegolmError::MissingOutboundSession)?;
+        if session.expired() {
+            return Err(MegolmError::MissingOutboundSession);
+        }
 
         let result = session.encrypt(event_type, content).await;
 
@@ -1132,6 +1133,38 @@ mod tests {
 
     fn alice_device_id() -> &'static DeviceId {
         device_id!("JLAFKJWSCS")
+    }
+
+    #[async_test]
+    async fn test_encrypt_without_a_shared_outbound_session_returns_an_error() {
+        let machine = OlmMachine::new(alice_id(), alice_device_id()).await;
+        let content = ruma::serde::Raw::new(&json!({ "body": "test", "msgtype": "m.text" }))
+            .unwrap()
+            .cast_unchecked();
+        let result = machine
+            .encrypt_room_event_raw(room_id!("!room:example.org"), "m.room.message", &content)
+            .await;
+        assert!(matches!(result, Err(crate::error::MegolmError::MissingOutboundSession)));
+    }
+
+    #[async_test]
+    async fn test_encrypt_with_expired_outbound_session_returns_an_error() {
+        let machine = OlmMachine::new(alice_id(), alice_device_id()).await;
+        let room_id = room_id!("!room:example.org");
+        let settings = EncryptionSettings { rotation_period_msgs: 1, ..Default::default() };
+        machine.share_room_key(room_id, std::iter::empty(), settings.clone()).await.unwrap();
+        let content = ruma::serde::Raw::new(&json!({ "body": "test", "msgtype": "m.text" }))
+            .unwrap()
+            .cast_unchecked();
+
+        machine.encrypt_room_event_raw(room_id, "m.room.message", &content).await.unwrap();
+        assert!(matches!(
+            machine.encrypt_room_event_raw(room_id, "m.room.message", &content).await,
+            Err(crate::error::MegolmError::MissingOutboundSession)
+        ));
+
+        machine.share_room_key(room_id, std::iter::empty(), settings).await.unwrap();
+        machine.encrypt_room_event_raw(room_id, "m.room.message", &content).await.unwrap();
     }
 
     /// Returns a /keys/query response for user "@example:localhost"
